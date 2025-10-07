@@ -11,7 +11,7 @@ public class TextFilesMerger {
 
     public static void main(String[] args) {
         // String sourceDirectory = "./source"; // Исходная директория
-        String sourceDirectory = "C:\\JavaProjects\\MUMPS_BD\\src\\main\\java\\ru\\miacomsoft\\mumpsdb"; // Текущая директория
+        String sourceDirectory = "C:\\JavaProjects\\MUMPS_BD\\src\\main"; // Текущая директория
         String outputFile = "./result/merged_files.txt"; // Результирующий файл
 
         try {
