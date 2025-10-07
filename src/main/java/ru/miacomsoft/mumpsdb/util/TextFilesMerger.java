@@ -108,7 +108,7 @@ public class TextFilesMerger {
      */
     private static void writeFileContent(File file, BufferedWriter writer) throws IOException {
         // Добавляем разделитель с информацией о файле
-        writer.write("=== Файл: " + file.getPath() + " ===");
+        writer.write("// === Файл: " + file.getPath() + " ===");
         writer.newLine();
         writer.newLine();
 

@@ -1,3 +1,4 @@
+
 package ru.miacomsoft.mumpsdb.core;
 
 import ru.miacomsoft.mumpsdb.ConfigLoader;
@@ -6,12 +7,20 @@ import ru.miacomsoft.mumpsdb.embedding.EmbeddingStorage;
 import ru.miacomsoft.mumpsdb.embedding.VectorSearchResult;
 import ru.miacomsoft.mumpsdb.monitoring.MetricsCollector;
 import ru.miacomsoft.mumpsdb.replication.ReplicationManager;
+import ru.miacomsoft.mumpsdb.security.SecurityManager;
+import ru.miacomsoft.mumpsdb.sharding.ShardingManager;
+import ru.miacomsoft.mumpsdb.index.CompositeIndex;
+import ru.miacomsoft.mumpsdb.backup.IncrementalBackup;
+import ru.miacomsoft.mumpsdb.index.IndexResult;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.io.IOException;
 
 public class Database {
     private final Map<String, TreeNode> globalStorage = new ConcurrentHashMap<>();
@@ -36,6 +45,12 @@ public class Database {
     private final MetricsCollector metrics;
     private final ReplicationManager replicationManager;
 
+    // Новые поля для расширенных функций
+    private final SecurityManager securityManager;
+    private final ShardingManager shardingManager;
+    private final CompositeIndex compositeIndex;
+    private final IncrementalBackup incrementalBackup;
+
     public Database() {
         this.configLoader = new ConfigLoader();
         this.autoEmbeddingEnabled = configLoader.isAutoEmbeddingEnabled();
@@ -44,8 +59,20 @@ public class Database {
         this.metrics = MetricsCollector.getInstance();
         this.replicationManager = new ReplicationManager(this);
 
+        // Инициализация новых менеджеров
+        this.securityManager = new SecurityManager();
+        this.shardingManager = new ShardingManager(
+                Boolean.parseBoolean(configLoader.getProperties().getProperty("sharding.enabled", "false"))
+        );
+        this.compositeIndex = new CompositeIndex(this);
+        this.incrementalBackup = new IncrementalBackup(this,
+                configLoader.getProperties().getProperty("backup.directory", "backups"));
+
         // Запуск очистки кэша
         startCacheCleanup();
+
+        // Запуск периодических бэкапов
+        startScheduledBackups();
     }
 
     /**
@@ -75,6 +102,11 @@ public class Database {
                     // Обновляем индексы
                     updateIndexes(globalName, normalizedPath, value);
 
+                    // Обновляем составные индексы
+                    if (path.length > 0) {
+                        compositeIndex.indexMultipleFields(globalName, normalizedPath, value);
+                    }
+
                     // Автоматически создаем embedding если включено
                     if (autoEmbeddingEnabled && value != null) {
                         try {
@@ -95,6 +127,31 @@ public class Database {
             metrics.incrementCounter("set_operations");
         } finally {
             metrics.recordOperationTime("set", startTime);
+        }
+    }
+
+    /**
+     * Безопасная установка значения с проверкой прав доступа
+     */
+    public void setWithSecurity(String sessionId, String global, Object value, Object... path) {
+        ru.miacomsoft.mumpsdb.security.UserSession session = securityManager.getSession(sessionId);
+        if (session == null || !session.isValid()) {
+            throw new SecurityException("Invalid session");
+        }
+
+        if (!securityManager.checkGlobalPermission(session.getUser(), global,
+                ru.miacomsoft.mumpsdb.security.SecurityManager.Permission.WRITE)) {
+            throw new SecurityException("No write permission for global: " + global);
+        }
+
+        // Определяем шард для распределенного хранения
+        String shardId = shardingManager.determineShard(global);
+
+        set(global, value, path);
+
+        // Индексируем составные поля если нужно
+        if (path.length > 0) {
+            compositeIndex.indexMultipleFields(global, path, value);
         }
     }
 
@@ -135,6 +192,23 @@ public class Database {
     }
 
     /**
+     * Безопасное получение значения с проверкой прав доступа
+     */
+    public Object getWithSecurity(String sessionId, String global, Object... path) {
+        ru.miacomsoft.mumpsdb.security.UserSession session = securityManager.getSession(sessionId);
+        if (session == null || !session.isValid()) {
+            throw new SecurityException("Invalid session");
+        }
+
+        if (!securityManager.checkGlobalPermission(session.getUser(), global,
+                ru.miacomsoft.mumpsdb.security.SecurityManager.Permission.READ)) {
+            throw new SecurityException("No read permission for global: " + global);
+        }
+
+        return get(global, path);
+    }
+
+    /**
      * Быстрый поиск по значению с использованием индекса
      */
     public List<SearchResult> fastSearch(String value) {
@@ -172,6 +246,34 @@ public class Database {
             return results;
         } finally {
             metrics.recordOperationTime("fast_search", startTime);
+        }
+    }
+
+    /**
+     * Поиск с использованием составных индексов
+     */
+    public List<IndexResult> searchWithIndex(String indexName, Object[] query) {
+        long startTime = System.currentTimeMillis();
+        try {
+            List<IndexResult> results = compositeIndex.search(indexName, query);
+            metrics.incrementCounter("composite_index_search");
+            return results;
+        } finally {
+            metrics.recordOperationTime("composite_index_search", startTime);
+        }
+    }
+
+    /**
+     * Поиск по диапазону с использованием составных индексов
+     */
+    public List<IndexResult> rangeSearchWithIndex(String indexName, Object[] minValues, Object[] maxValues) {
+        long startTime = System.currentTimeMillis();
+        try {
+            List<IndexResult> results = compositeIndex.rangeSearch(indexName, minValues, maxValues);
+            metrics.incrementCounter("range_search");
+            return results;
+        } finally {
+            metrics.recordOperationTime("range_search", startTime);
         }
     }
 
@@ -221,6 +323,27 @@ public class Database {
         }, 300000, 300000); // Каждые 5 минут
     }
 
+    /**
+     * Запуск периодических бэкапов
+     */
+    private void startScheduledBackups() {
+        Timer timer = new Timer(true);
+        long backupInterval = Long.parseLong(
+                configLoader.getProperties().getProperty("backup.interval.hours", "24")) * 60 * 60 * 1000;
+
+        timer.schedule(new TimerTask() {
+            @Override
+            public void run() {
+                try {
+                    incrementalBackup.createIncrementalSnapshot();
+                    System.out.println("Scheduled incremental backup completed");
+                } catch (Exception e) {
+                    System.err.println("Scheduled backup failed: " + e.getMessage());
+                }
+            }
+        }, backupInterval, backupInterval);
+    }
+
     private void cleanupCache() {
         if (queryCache.size() > MAX_CACHE_SIZE) {
             // Удаляем 20% самых старых записей
@@ -254,7 +377,6 @@ public class Database {
         }
     }
 
-    // Остальные методы остаются без изменений...
     public void kill(String global, Object... path) {
         long startTime = System.currentTimeMillis();
         try {
@@ -272,6 +394,8 @@ public class Database {
                         if (autoEmbeddingEnabled) {
                             embeddingStorage.removeAllEmbeddings(globalName);
                         }
+                        // Удаляем из составных индексов
+                        compositeIndex.removeIndex(globalName);
                     } else {
                         TreeNode tree = globalStorage.get(globalName);
                         if (tree != null) {
@@ -364,9 +488,7 @@ public class Database {
         if (!currentPath.isEmpty()) {
             nodeBuilder.append("(");
             for (int i = 0; i < currentPath.size(); i++) {
-                if (i > 0) {
-                    nodeBuilder.append(",");
-                }
+                if (i > 0) nodeBuilder.append(", ");
                 Object pathElement = currentPath.get(i);
                 if (pathElement instanceof String) {
                     nodeBuilder.append("\"").append(pathElement).append("\"");
@@ -407,6 +529,13 @@ public class Database {
             stats.put("cacheSize", queryCache.size());
             stats.put("indexSize", valueIndex.size());
             stats.put("replicaCount", replicationManager.getReplicas().size());
+
+            // Добавляем статистику новых функций
+            stats.put("shardingEnabled", shardingManager.isEnabled());
+            stats.put("shardCount", shardingManager.getShardCount());
+            stats.put("compositeIndexCount", compositeIndex.getIndexNames().size());
+            stats.put("activeUsers", securityManager.getActiveUsersCount());
+
             return stats;
         } finally {
             storageLock.readLock().unlock();
@@ -517,6 +646,108 @@ public class Database {
         return replicationManager;
     }
 
+    // Новые методы для расширенных функций
+
+    /**
+     * Создание составного индекса
+     */
+    public void createCompositeIndex(String indexName, String[] fields, CompositeIndex.IndexType type) {
+        compositeIndex.createIndex(indexName, fields, type);
+    }
+
+    /**
+     * Создание инкрементального бэкапа
+     */
+    public String createIncrementalBackup() {
+        try {
+            return incrementalBackup.createIncrementalSnapshot();
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to create incremental backup", e);
+        }
+    }
+
+    /**
+     * Создание полного бэкапа
+     */
+    public String createFullBackup() {
+        try {
+            return incrementalBackup.createFullBackup();
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to create full backup", e);
+        }
+    }
+
+    /**
+     * Восстановление из бэкапа
+     */
+    public void restoreFromBackup(String backupId) {
+        try {
+            incrementalBackup.restoreFromBackup(backupId);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to restore from backup: " + backupId, e);
+        }
+    }
+
+    /**
+     * Восстановление на определенную дату
+     */
+    public void restoreToPointInTime(long timestamp) {
+        try {
+            incrementalBackup.restoreToPointInTime(timestamp);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to restore to point in time: " + new Date(timestamp), e);
+        }
+    }
+
+    /**
+     * Добавление шарда в кластер
+     */
+    public void addShardNode(String nodeId, String host, int port, int weight) {
+        shardingManager.addShardNode(nodeId, host, port, weight);
+    }
+
+    /**
+     * Ребалансировка шардов
+     */
+    public void rebalanceShards() {
+        shardingManager.rebalanceShards();
+    }
+
+    /**
+     * Оптимизация индексов
+     */
+    public void optimizeIndexes() {
+        compositeIndex.optimizeIndexes();
+    }
+
+    /**
+     * Очистка старых бэкапов
+     */
+    public void cleanupOldBackups(int keepDays) {
+        try {
+            incrementalBackup.cleanupOldBackups(keepDays);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to cleanup old backups", e);
+        }
+    }
+
+    // Getters для новых менеджеров
+    public SecurityManager getSecurityManager() {
+        return securityManager;
+    }
+
+    public ShardingManager getShardingManager() {
+        return shardingManager;
+    }
+
+    public CompositeIndex getCompositeIndex() {
+        return compositeIndex;
+    }
+
+    public IncrementalBackup getIncrementalBackup() {
+        return incrementalBackup;
+    }
+
     // Приватные вспомогательные методы
     private int countAllNodes() {
         int count = 0;
@@ -591,6 +822,7 @@ public class Database {
     private static class ParsedGlobal {
         String globalName;
         Object[] path;
+
         ParsedGlobal(String globalName, Object[] path) {
             this.globalName = globalName;
             this.path = path;
@@ -806,8 +1038,27 @@ public class Database {
         }
 
         // Getters
-        public String getGlobal() { return global; }
-        public Object[] getPath() { return path; }
-        public Object getValue() { return value; }
+        public String getGlobal() {
+            return global;
+        }
+
+        public Object[] getPath() {
+            return path;
+        }
+
+        public Object getValue() {
+            return value;
+        }
+    }
+
+    // Исключение для ошибок безопасности
+    public static class SecurityException extends RuntimeException {
+        public SecurityException(String message) {
+            super(message);
+        }
+
+        public SecurityException(String message, Throwable cause) {
+            super(message, cause);
+        }
     }
 }
