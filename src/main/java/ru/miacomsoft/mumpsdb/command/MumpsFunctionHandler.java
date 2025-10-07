@@ -1,6 +1,7 @@
 package ru.miacomsoft.mumpsdb.command;
 
 import ru.miacomsoft.mumpsdb.core.Database;
+import ru.miacomsoft.mumpsdb.util.DebugUtil;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -10,7 +11,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Обработчик функций MUMPS ($ORDER, $DATA, etc.)
+ * Улучшенный обработчик функций MUMPS ($ORDER, $DATA, etc.)
  */
 public class MumpsFunctionHandler {
 
@@ -37,29 +38,33 @@ public class MumpsFunctionHandler {
     public Object processFunctions(String expression) {
         if (expression == null) return expression;
 
-        System.out.println("DEBUG FUNCTION HANDLER: Processing expression: " + expression);
+        DebugUtil.debug("FUNCTION HANDLER: Processing expression: %s", expression);
 
         String result = expression;
 
-        // Обрабатываем $ORDER
-        Matcher orderMatcher = ORDER_PATTERN.matcher(result);
-        while (orderMatcher.find()) {
-            System.out.println("DEBUG FUNCTION HANDLER: Found $ORDER: " + orderMatcher.group());
-            String orderResult = executeOrderFunction(orderMatcher);
-            System.out.println("DEBUG FUNCTION HANDLER: $ORDER result: '" + orderResult + "'");
-            result = result.substring(0, orderMatcher.start()) +
-                    orderResult +
-                    result.substring(orderMatcher.end());
-            orderMatcher = ORDER_PATTERN.matcher(result);
-        }
+        try {
+            // Обрабатываем $ORDER
+            Matcher orderMatcher = ORDER_PATTERN.matcher(result);
+            while (orderMatcher.find()) {
+                DebugUtil.debug("FUNCTION HANDLER: Found $ORDER: %s", orderMatcher.group());
+                String orderResult = executeOrderFunction(orderMatcher);
+                DebugUtil.debug("FUNCTION HANDLER: $ORDER result: '%s'", orderResult);
+                result = result.substring(0, orderMatcher.start()) +
+                        orderResult +
+                        result.substring(orderMatcher.end());
+                orderMatcher = ORDER_PATTERN.matcher(result);
+            }
 
-        System.out.println("DEBUG FUNCTION HANDLER: Final result: " + result);
-        return result;
+            DebugUtil.debug("FUNCTION HANDLER: Final result: %s", result);
+            return result;
+
+        } catch (Exception e) {
+            DebugUtil.debug("FUNCTION HANDLER: Error processing functions: %s", e.getMessage());
+            // В случае ошибки возвращаем оригинальное выражение
+            return expression;
+        }
     }
 
-    /**
-     * Выполняет функцию $ORDER
-     */
     /**
      * Выполняет функцию $ORDER
      */
@@ -69,7 +74,11 @@ public class MumpsFunctionHandler {
             String subscriptStr = matcher.group(2);
             String directionStr = matcher.group(3);
 
-            System.out.println("DEBUG ORDER FUNCTION: global=" + global + ", subscriptStr=" + subscriptStr + ", directionStr=" + directionStr);
+            DebugUtil.debug("ORDER FUNCTION: global=%s, subscriptStr=%s, directionStr=%s",
+                    global, subscriptStr, directionStr);
+
+            // Валидация входных параметров
+            validateOrderParameters(global, subscriptStr);
 
             // Парсим подписки
             Object[] path;
@@ -79,7 +88,7 @@ public class MumpsFunctionHandler {
                 path = new Object[0];
             }
 
-            System.out.println("DEBUG ORDER FUNCTION: parsed path=" + Arrays.toString(path));
+            DebugUtil.debug("ORDER FUNCTION: parsed path=%s", Arrays.toString(path));
 
             // Определяем направление
             int direction = 1;
@@ -94,28 +103,58 @@ public class MumpsFunctionHandler {
                 result = getNextGlobalIndex(global, direction);
             } else {
                 // Поиск следующей подписки
-                // ВАЖНО: если последний элемент пути - переменная, используем её значение
                 result = getNextSubscriptIndexSimple(global, path, direction);
             }
 
-            System.out.println("DEBUG ORDER FUNCTION: result='" + result + "'");
+            DebugUtil.debug("ORDER FUNCTION: result='%s'", result);
             return result != null ? result : "";
 
         } catch (Exception e) {
-            System.err.println("Error executing $ORDER: " + e.getMessage());
-            e.printStackTrace();
+            DebugUtil.debug("Error executing $ORDER: %s", e.getMessage());
+            // В случае ошибки возвращаем пустую строку
             return "";
         }
     }
+
+    private void validateOrderParameters(String global, String subscriptStr) {
+        if (global == null || global.trim().isEmpty()) {
+            throw new IllegalArgumentException("Global name cannot be empty in $ORDER");
+        }
+
+        // Проверяем корректность глобала
+        if (!global.startsWith("^") && !isValidVariableName(global)) {
+            throw new IllegalArgumentException("Invalid global name: " + global);
+        }
+
+        // Проверяем подписки если они есть
+        if (subscriptStr != null && !subscriptStr.trim().isEmpty()) {
+            try {
+                parsePath(subscriptStr);
+            } catch (Exception e) {
+                throw new IllegalArgumentException("Invalid subscript format: " + subscriptStr);
+            }
+        }
+    }
+
+    /**
+     * Проверяет, является ли строка допустимым именем переменной
+     */
+    private boolean isValidVariableName(String name) {
+        if (name == null || name.trim().isEmpty()) {
+            return false;
+        }
+
+        // Проверяем, что это допустимое имя переменной (только буквы, цифры, подчеркивание)
+        // и не содержит специальных символов
+        return name.matches("[a-zA-Z_][a-zA-Z0-9_]*");
+    }
+
     /**
      * Упрощенная версия для отладки
      */
     private String getNextSubscriptIndexSimple(String global, Object[] path, int direction) {
         try {
-            System.out.println("DEBUG SIMPLE ORDER: global=" + global + ", path=" + Arrays.toString(path));
-
-            // Для случая $ORDER(^Test,node) мы должны искать подписки первого уровня ^Test(*)
-            // поскольку node - это переменная, и её текущее значение ""
+            DebugUtil.debug("SIMPLE ORDER: global=%s, path=%s", global, Arrays.toString(path));
 
             String globalName = normalizeGlobalName(global);
             List<String> nodes = database.getGlobalNodesZW(globalName);
@@ -129,7 +168,7 @@ public class MumpsFunctionHandler {
                 }
             }
 
-            System.out.println("DEBUG SIMPLE ORDER: First level subscripts: " + firstLevelSubscripts);
+            DebugUtil.debug("SIMPLE ORDER: First level subscripts: %s", firstLevelSubscripts);
 
             if (firstLevelSubscripts.isEmpty()) {
                 return "";
@@ -147,7 +186,7 @@ public class MumpsFunctionHandler {
                 }
             }
 
-            System.out.println("DEBUG SIMPLE ORDER: Current value: '" + currentValue + "'");
+            DebugUtil.debug("SIMPLE ORDER: Current value: '%s'", currentValue);
 
             // Если текущее значение пустое, возвращаем первую подпись
             if (currentValue.isEmpty()) {
@@ -175,10 +214,11 @@ public class MumpsFunctionHandler {
             return firstLevelSubscripts.get(nextIndex);
 
         } catch (Exception e) {
-            System.err.println("Error in simple order: " + e.getMessage());
+            DebugUtil.debug("Error in simple order: %s", e.getMessage());
             return "";
         }
     }
+
     /**
      * Получает следующий/предыдущий глобал
      */
@@ -217,21 +257,15 @@ public class MumpsFunctionHandler {
     /**
      * Получает следующую/предыдущую подпись
      */
-    /**
-     * Получает следующую/предыдущую подпись
-     */
-    /**
-     * Получает следующую/предыдущую подпись
-     */
     private String getNextSubscriptIndex(String global, Object[] path, int direction) {
         try {
             String globalName = normalizeGlobalName(global);
 
-            System.out.println("DEBUG ORDER: global=" + global + ", path=" + Arrays.toString(path) + ", direction=" + direction);
+            DebugUtil.debug("ORDER: global=%s, path=%s, direction=%s", global, Arrays.toString(path), direction);
 
             // Получаем все узлы глобала
             List<String> nodes = database.getGlobalNodesZW(globalName);
-            System.out.println("DEBUG ORDER: Found " + nodes.size() + " nodes");
+            DebugUtil.debug("ORDER: Found %d nodes", nodes.size());
 
             if (nodes.isEmpty()) {
                 return "";
@@ -239,11 +273,11 @@ public class MumpsFunctionHandler {
 
             // Обрабатываем путь - заменяем переменные их значениями
             Object[] processedPath = processPathVariables(path);
-            System.out.println("DEBUG ORDER: Processed path: " + Arrays.toString(processedPath));
+            DebugUtil.debug("ORDER: Processed path: %s", Arrays.toString(processedPath));
 
             // Извлекаем дочерние подписки для обработанного пути
             List<String> childSubscripts = extractChildSubscripts(nodes, processedPath);
-            System.out.println("DEBUG ORDER: Child subscripts: " + childSubscripts);
+            DebugUtil.debug("ORDER: Child subscripts: %s", childSubscripts);
 
             if (childSubscripts.isEmpty()) {
                 return "";
@@ -251,7 +285,7 @@ public class MumpsFunctionHandler {
 
             // Сортируем
             Collections.sort(childSubscripts, this::compareSubscripts);
-            System.out.println("DEBUG ORDER: Sorted subscripts: " + childSubscripts);
+            DebugUtil.debug("ORDER: Sorted subscripts: %s", childSubscripts);
 
             // Получаем текущую подпись (последний элемент обработанного пути)
             String currentSubscript = "";
@@ -260,12 +294,12 @@ public class MumpsFunctionHandler {
                 currentSubscript = lastElement != null ? lastElement.toString() : "";
             }
 
-            System.out.println("DEBUG ORDER: Current subscript: '" + currentSubscript + "'");
+            DebugUtil.debug("ORDER: Current subscript: '%s'", currentSubscript);
 
             // Если текущая подпись пустая, возвращаем первый/последний
             if (currentSubscript.isEmpty()) {
                 String result = direction == 1 ? childSubscripts.get(0) : childSubscripts.get(childSubscripts.size() - 1);
-                System.out.println("DEBUG ORDER: Empty current, returning: '" + result + "'");
+                DebugUtil.debug("ORDER: Empty current, returning: '%s'", result);
                 return result;
             }
 
@@ -278,28 +312,27 @@ public class MumpsFunctionHandler {
                 }
             }
 
-            System.out.println("DEBUG ORDER: Current index: " + currentIndex);
+            DebugUtil.debug("ORDER: Current index: %d", currentIndex);
 
             if (currentIndex == -1) {
                 // Подпись не найдена - возвращаем первую/последнюю
                 String result = direction == 1 ? childSubscripts.get(0) : childSubscripts.get(childSubscripts.size() - 1);
-                System.out.println("DEBUG ORDER: Current not found, returning: '" + result + "'");
+                DebugUtil.debug("ORDER: Current not found, returning: '%s'", result);
                 return result;
             }
 
             int nextIndex = currentIndex + direction;
             if (nextIndex < 0 || nextIndex >= childSubscripts.size()) {
-                System.out.println("DEBUG ORDER: End of list reached");
+                DebugUtil.debug("ORDER: End of list reached");
                 return "";
             }
 
             String result = childSubscripts.get(nextIndex);
-            System.out.println("DEBUG ORDER: Next subscript: '" + result + "'");
+            DebugUtil.debug("ORDER: Next subscript: '%s'", result);
             return result;
 
         } catch (Exception e) {
-            System.err.println("Error in getNextSubscriptIndex: " + e.getMessage());
-            e.printStackTrace();
+            DebugUtil.debug("Error in getNextSubscriptIndex: %s", e.getMessage());
             return "";
         }
     }
@@ -319,7 +352,7 @@ public class MumpsFunctionHandler {
                 if (writeCommand != null && isLocalVariable(strElement)) {
                     Object varValue = writeCommand.getLocalVariable(strElement);
                     processed[i] = varValue != null ? varValue : "";
-                    System.out.println("DEBUG PROCESS PATH: Variable '" + strElement + "' -> '" + processed[i] + "'");
+                    DebugUtil.debug("PROCESS PATH: Variable '%s' -> '%s'", strElement, processed[i]);
                 } else {
                     processed[i] = element;
                 }
@@ -329,6 +362,7 @@ public class MumpsFunctionHandler {
         }
         return processed;
     }
+
     /**
      * Извлекает дочерние подписки
      */
@@ -337,30 +371,29 @@ public class MumpsFunctionHandler {
         // Мы ищем узлы, которые находятся на один уровень глубже parentPath
         int targetLevel = parentPath.length + 1;
 
-        System.out.println("DEBUG EXTRACT: Looking for children at level " + targetLevel + " for path " + Arrays.toString(parentPath));
+        DebugUtil.debug("EXTRACT: Looking for children at level %d for path %s", targetLevel, Arrays.toString(parentPath));
 
         for (String node : nodes) {
             try {
                 Object[] nodePath = parseNodePath(node);
-                System.out.println("DEBUG EXTRACT: Node path: " + Arrays.toString(nodePath) + " (length: " + nodePath.length + ")");
+                DebugUtil.debug("EXTRACT: Node path: %s (length: %d)", Arrays.toString(nodePath), nodePath.length);
 
                 // Проверяем, что узел находится на нужном уровне и начинается с parentPath
                 if (nodePath.length == targetLevel && startsWith(nodePath, parentPath)) {
                     Object lastElement = nodePath[nodePath.length - 1];
                     childSubscripts.add(lastElement.toString());
-                    System.out.println("DEBUG EXTRACT: Added child: " + lastElement);
+                    DebugUtil.debug("EXTRACT: Added child: %s", lastElement);
                 }
             } catch (Exception e) {
-                System.out.println("DEBUG EXTRACT: Error parsing node: " + e.getMessage());
+                DebugUtil.debug("EXTRACT: Error parsing node: %s", e.getMessage());
             }
         }
 
-        System.out.println("DEBUG EXTRACT: Total children found: " + childSubscripts.size());
+        DebugUtil.debug("EXTRACT: Total children found: %d", childSubscripts.size());
         return childSubscripts;
     }
 
-    // Вспомогательные методы (такие же как раньше)
-
+    // Вспомогательные методы
     private Object[] parsePath(String pathStr) {
         if (pathStr == null || pathStr.trim().isEmpty()) {
             return new Object[0];
@@ -424,7 +457,7 @@ public class MumpsFunctionHandler {
 
     private boolean startsWith(Object[] array, Object[] prefix) {
         if (prefix.length > array.length) {
-            System.out.println("DEBUG STARTSWITH: Prefix longer than array");
+            DebugUtil.debug("STARTSWITH: Prefix longer than array");
             return false;
         }
 
@@ -432,15 +465,15 @@ public class MumpsFunctionHandler {
             String arrayElem = array[i] != null ? array[i].toString() : "";
             String prefixElem = prefix[i] != null ? prefix[i].toString() : "";
 
-            System.out.println("DEBUG STARTSWITH: Comparing [" + i + "]: '" + arrayElem + "' vs '" + prefixElem + "'");
+            DebugUtil.debug("STARTSWITH: Comparing [%d]: '%s' vs '%s'", i, arrayElem, prefixElem);
 
             if (!arrayElem.equals(prefixElem)) {
-                System.out.println("DEBUG STARTSWITH: Mismatch at index " + i);
+                DebugUtil.debug("STARTSWITH: Mismatch at index %d", i);
                 return false;
             }
         }
 
-        System.out.println("DEBUG STARTSWITH: Match found");
+        DebugUtil.debug("STARTSWITH: Match found");
         return true;
     }
 

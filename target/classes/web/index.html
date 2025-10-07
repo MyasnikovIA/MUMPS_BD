@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MUMPS DB Web Terminal</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Courier New', monospace;
+            background: #1e1e1e;
+            color: #00ff00;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        .terminal {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            padding: 20px;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 20px;
+            padding: 10px;
+            border-bottom: 1px solid #00ff00;
+        }
+
+        .output {
+            flex: 1;
+            overflow-y: auto;
+            background: #000;
+            padding: 15px;
+            border: 1px solid #333;
+            border-radius: 5px;
+            margin-bottom: 10px;
+        }
+
+        .command-line {
+            display: flex;
+            align-items: center;
+            background: #000;
+            padding: 10px;
+            border: 1px solid #333;
+            border-radius: 5px;
+        }
+
+        .prompt {
+            color: #00ff00;
+            margin-right: 10px;
+            font-weight: bold;
+        }
+
+        .input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            color: #00ff00;
+            font-family: 'Courier New', monospace;
+            font-size: 16px;
+            outline: none;
+        }
+
+        .message {
+            margin: 5px 0;
+            line-height: 1.4;
+        }
+
+        .command {
+            color: #ffff00;
+        }
+
+        .result {
+            color: #00ff00;
+        }
+
+        .error {
+            color: #ff0000;
+        }
+
+        .debug {
+            color: #888888;
+            font-style: italic;
+        }
+
+        .metrics {
+            color: #00ffff;
+            font-size: 12px;
+            margin-top: 10px;
+            padding: 5px;
+            background: #2a2a2a;
+            border-radius: 3px;
+        }
+
+        .status-bar {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 10px;
+            font-size: 12px;
+            color: #888;
+        }
+
+        .connection-status {
+            padding: 2px 8px;
+            border-radius: 3px;
+        }
+
+        .connected {
+            background: #004400;
+            color: #00ff00;
+        }
+
+        .disconnected {
+            background: #440000;
+            color: #ff0000;
+        }
+
+        .suggestions {
+            position: absolute;
+            background: #2a2a2a;
+            border: 1px solid #333;
+            border-radius: 3px;
+            max-height: 150px;
+            overflow-y: auto;
+            z-index: 1000;
+        }
+
+        .suggestion {
+            padding: 5px 10px;
+            cursor: pointer;
+        }
+
+        .suggestion:hover {
+            background: #333;
+        }
+    </style>
+</head>
+<body>
+<div class="terminal">
+    <div class="header">
+        <h1>MUMPS Database Web Terminal</h1>
+        <div class="status-bar">
+            <div>Server: <span id="serverStatus" class="connection-status disconnected">Disconnected</span></div>
+            <div>Clients: <span id="clientCount">0</span></div>
+            <div>Response Time: <span id="responseTime">-</span>ms</div>
+        </div>
+    </div>
+
+    <div class="output" id="output">
+        <div class="message">Connecting to MUMPS Database Server...</div>
+    </div>
+
+    <div class="command-line">
+        <span class="prompt">MUMPS></span>
+        <input type="text" class="input" id="commandInput" placeholder="Type command...">
+    </div>
+
+    <div class="suggestions" id="suggestions" style="display: none;"></div>
+
+    <div class="metrics" id="metrics">
+        Loading metrics...
+    </div>
+</div>
+
+<script>
+    class MumpsTerminal {
+        constructor() {
+            this.output = document.getElementById('output');
+            this.commandInput = document.getElementById('commandInput');
+            this.suggestions = document.getElementById('suggestions');
+            this.metrics = document.getElementById('metrics');
+            this.serverStatus = document.getElementById('serverStatus');
+            this.clientCount = document.getElementById('clientCount');
+            this.responseTime = document.getElementById('responseTime');
+
+            this.eventSource = null;
+            this.commandHistory = [];
+            this.historyIndex = -1;
+            this.isConnected = false;
+
+            this.initializeEventSource();
+            this.setupEventListeners();
+            this.loadCommandHistory();
+        }
+
+        initializeEventSource() {
+            try {
+                this.eventSource = new EventSource('/events');
+
+                this.eventSource.onopen = () => {
+                    this.setConnectionStatus(true);
+                    this.addMessage('Connected to server', 'result');
+                };
+
+                this.eventSource.onerror = () => {
+                    this.setConnectionStatus(false);
+                    this.addMessage('Connection lost', 'error');
+                };
+
+                this.eventSource.addEventListener('connected', (event) => {
+                    const data = JSON.parse(event.data);
+                    this.clientId = data.clientId;
+                    this.addMessage(`Client ID: ${data.clientId}`, 'debug');
+                });
+
+                this.eventSource.addEventListener('metrics', (event) => {
+                    this.updateMetrics(JSON.parse(event.data));
+                });
+
+            } catch (error) {
+                this.addMessage(`Failed to connect: ${error.message}`, 'error');
+            }
+        }
+
+        setupEventListeners() {
+            this.commandInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    this.executeCommand();
+                } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    this.navigateHistory(-1);
+                } else if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    this.navigateHistory(1);
+                } else if (e.key === 'Tab') {
+                    e.preventDefault();
+                    this.showSuggestions();
+                }
+            });
+
+            this.commandInput.addEventListener('input', () => {
+                this.hideSuggestions();
+            });
+        }
+
+        async executeCommand() {
+            const command = this.commandInput.value.trim();
+            if (!command) return;
+
+            this.addMessage(`MUMPS> ${command}`, 'command');
+            this.commandInput.value = '';
+
+            // Сохраняем в историю
+            this.commandHistory.push(command);
+            this.historyIndex = this.commandHistory.length;
+            this.saveCommandHistory();
+
+            const startTime = Date.now();
+
+            try {
+                const response = await fetch('/api/command', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ command: command })
+                });
+
+                const result = await response.json();
+                const responseTime = Date.now() - startTime;
+                this.responseTime.textContent = responseTime;
+
+                if (result.success) {
+                    this.addMessage(result.result, 'result');
+                } else {
+                    this.addMessage(`ERROR: ${result.error}`, 'error');
+                }
+            } catch (error) {
+                this.addMessage(`Network error: ${error.message}`, 'error');
+            }
+        }
+
+        addMessage(text, type = 'message') {
+            // Если текст содержит символы переноса строки, разбиваем его на отдельные строки
+            if (text.includes('\n')) {
+                const lines = text.split('\n');
+                lines.forEach(line => {
+                    if (line.trim() !== '') { // Игнорируем пустые строки
+                        const message = document.createElement('div');
+                        message.className = `message ${type}`;
+                        message.textContent = line;
+                        this.output.appendChild(message);
+                    }
+                });
+            } else {
+                const message = document.createElement('div');
+                message.className = `message ${type}`;
+                message.textContent = text;
+                this.output.appendChild(message);
+            }
+
+            this.output.scrollTop = this.output.scrollHeight;
+        }
+
+        setConnectionStatus(connected) {
+            this.isConnected = connected;
+            this.serverStatus.textContent = connected ? 'Connected' : 'Disconnected';
+            this.serverStatus.className = `connection-status ${connected ? 'connected' : 'disconnected'}`;
+        }
+
+        updateMetrics(data) {
+            let metricsText = `Metrics: `;
+            for (const [key, value] of Object.entries(data)) {
+                metricsText += `${key}: ${value} | `;
+            }
+            this.metrics.textContent = metricsText.slice(0, -3);
+
+            if (data.clients !== undefined) {
+                this.clientCount.textContent = data.clients;
+            }
+        }
+
+        navigateHistory(direction) {
+            if (this.commandHistory.length === 0) return;
+
+            this.historyIndex += direction;
+
+            if (this.historyIndex < 0) {
+                this.historyIndex = 0;
+            } else if (this.historyIndex >= this.commandHistory.length) {
+                this.historyIndex = this.commandHistory.length;
+                this.commandInput.value = '';
+                return;
+            }
+
+            this.commandInput.value = this.commandHistory[this.historyIndex];
+        }
+
+        showSuggestions() {
+            const input = this.commandInput.value.toLowerCase();
+            const commands = [
+                'SET ^global=value',
+                'GET ^global',
+                'KILL ^global',
+                'WRITE expression',
+                'QUERY ^global DEPTH n',
+                'ZW ^global',
+                'SIMSEARCH text',
+                'FSEARCH value',
+                'TSTART',
+                'TCOMMIT',
+                'STATS',
+                'HELP'
+            ];
+
+            const matches = commands.filter(cmd =>
+                cmd.toLowerCase().includes(input)
+            );
+
+            if (matches.length > 0) {
+                this.suggestions.innerHTML = '';
+                matches.forEach(cmd => {
+                    const div = document.createElement('div');
+                    div.className = 'suggestion';
+                    div.textContent = cmd;
+                    div.onclick = () => {
+                        this.commandInput.value = cmd;
+                        this.hideSuggestions();
+                        this.commandInput.focus();
+                    };
+                    this.suggestions.appendChild(div);
+                });
+
+                this.suggestions.style.display = 'block';
+                this.suggestions.style.width = this.commandInput.offsetWidth + 'px';
+                this.suggestions.style.top = (this.commandInput.offsetTop + this.commandInput.offsetHeight) + 'px';
+                this.suggestions.style.left = this.commandInput.offsetLeft + 'px';
+            }
+        }
+
+        hideSuggestions() {
+            this.suggestions.style.display = 'none';
+        }
+
+        loadCommandHistory() {
+            const saved = localStorage.getItem('mumpsCommandHistory');
+            if (saved) {
+                this.commandHistory = JSON.parse(saved);
+                this.historyIndex = this.commandHistory.length;
+            }
+        }
+
+        saveCommandHistory() {
+            // Сохраняем только последние 100 команд
+            const toSave = this.commandHistory.slice(-100);
+            localStorage.setItem('mumpsCommandHistory', JSON.stringify(toSave));
+        }
+    }
+
+    // Инициализация терминала при загрузке страницы
+    document.addEventListener('DOMContentLoaded', () => {
+        window.terminal = new MumpsTerminal();
+    });
+</script>
+</body>
+</html>

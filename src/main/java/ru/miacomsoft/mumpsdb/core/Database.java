@@ -4,6 +4,8 @@ import ru.miacomsoft.mumpsdb.ConfigLoader;
 import ru.miacomsoft.mumpsdb.embedding.EmbeddingService;
 import ru.miacomsoft.mumpsdb.embedding.EmbeddingStorage;
 import ru.miacomsoft.mumpsdb.embedding.VectorSearchResult;
+import ru.miacomsoft.mumpsdb.monitoring.MetricsCollector;
+import ru.miacomsoft.mumpsdb.replication.ReplicationManager;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -30,11 +32,17 @@ public class Database {
     private boolean autoEmbeddingEnabled;
     private final ConfigLoader configLoader;
 
+    // Мониторинг и репликация
+    private final MetricsCollector metrics;
+    private final ReplicationManager replicationManager;
+
     public Database() {
         this.configLoader = new ConfigLoader();
         this.autoEmbeddingEnabled = configLoader.isAutoEmbeddingEnabled();
         this.embeddingService = new EmbeddingService();
         this.embeddingStorage = new EmbeddingStorage(embeddingService);
+        this.metrics = MetricsCollector.getInstance();
+        this.replicationManager = new ReplicationManager(this);
 
         // Запуск очистки кэша
         startCacheCleanup();
@@ -44,39 +52,49 @@ public class Database {
      * Оптимизированный метод SET с индексацией и кэшированием
      */
     public void set(String global, Object value, Object... path) {
-        validateGlobalName(global);
-        String globalName = normalizeGlobalName(global);
-        Object[] normalizedPath = normalizePathTypes(path);
+        long startTime = System.currentTimeMillis();
+        try {
+            validateSetOperation(global, path, value);
+            String globalName = normalizeGlobalName(global);
+            Object[] normalizedPath = normalizePathTypes(path);
 
-        String cacheKey = buildCacheKey(globalName, normalizedPath);
+            String cacheKey = buildCacheKey(globalName, normalizedPath);
 
-        Transaction transaction = currentTransaction.get();
-        if (transaction != null) {
-            transaction.set(globalName, normalizedPath, value);
-        } else {
-            storageLock.writeLock().lock();
-            try {
-                TreeNode tree = globalStorage.computeIfAbsent(globalName, k -> new TreeNode());
-                tree.setNode(normalizedPath, value);
+            Transaction transaction = currentTransaction.get();
+            if (transaction != null) {
+                transaction.set(globalName, normalizedPath, value);
+            } else {
+                storageLock.writeLock().lock();
+                try {
+                    TreeNode tree = globalStorage.computeIfAbsent(globalName, k -> new TreeNode());
+                    tree.setNode(normalizedPath, value);
 
-                // Обновляем кэш
-                queryCache.put(cacheKey, value);
+                    // Обновляем кэш
+                    queryCache.put(cacheKey, value);
 
-                // Обновляем индексы
-                updateIndexes(globalName, normalizedPath, value);
+                    // Обновляем индексы
+                    updateIndexes(globalName, normalizedPath, value);
 
-                // Автоматически создаем embedding если включено
-                if (autoEmbeddingEnabled && value != null) {
-                    try {
-                        float[] embedding = embeddingService.getEmbedding(value.toString());
-                        embeddingStorage.storeEmbedding(globalName, normalizedPath, value, embedding);
-                    } catch (Exception e) {
-                        System.err.println("Failed to create embedding for " + globalName + " path: " + Arrays.toString(normalizedPath) + ": " + e.getMessage());
+                    // Автоматически создаем embedding если включено
+                    if (autoEmbeddingEnabled && value != null) {
+                        try {
+                            float[] embedding = embeddingService.getEmbedding(value.toString());
+                            embeddingStorage.storeEmbedding(globalName, normalizedPath, value, embedding);
+                        } catch (Exception e) {
+                            System.err.println("Failed to create embedding for " + globalName + " path: " + Arrays.toString(normalizedPath) + ": " + e.getMessage());
+                        }
                     }
+
+                    // Репликация
+                    replicationManager.replicateSet(global, value, path);
+
+                } finally {
+                    storageLock.writeLock().unlock();
                 }
-            } finally {
-                storageLock.writeLock().unlock();
             }
+            metrics.incrementCounter("set_operations");
+        } finally {
+            metrics.recordOperationTime("set", startTime);
         }
     }
 
@@ -84,29 +102,35 @@ public class Database {
      * Оптимизированный метод GET с кэшированием
      */
     public Object get(String global, Object... path) {
-        validateGlobalName(global);
-        String globalName = normalizeGlobalName(global);
-
-        // Проверяем кэш
-        String cacheKey = buildCacheKey(globalName, path);
-        Object cachedValue = queryCache.get(cacheKey);
-        if (cachedValue != null) {
-            return cachedValue;
-        }
-
-        storageLock.readLock().lock();
+        long startTime = System.currentTimeMillis();
         try {
-            TreeNode tree = globalStorage.get(globalName);
-            Object result = tree != null ? tree.getNode(path) : null;
+            metrics.incrementCounter("get_operations");
+            validateGlobalName(global);
+            String globalName = normalizeGlobalName(global);
 
-            // Кэшируем результат
-            if (result != null) {
-                queryCache.put(cacheKey, result);
+            // Проверяем кэш
+            String cacheKey = buildCacheKey(globalName, path);
+            Object cachedValue = queryCache.get(cacheKey);
+            if (cachedValue != null) {
+                return cachedValue;
             }
 
-            return result;
+            storageLock.readLock().lock();
+            try {
+                TreeNode tree = globalStorage.get(globalName);
+                Object result = tree != null ? tree.getNode(path) : null;
+
+                // Кэшируем результат
+                if (result != null) {
+                    queryCache.put(cacheKey, result);
+                }
+
+                return result;
+            } finally {
+                storageLock.readLock().unlock();
+            }
         } finally {
-            storageLock.readLock().unlock();
+            metrics.recordOperationTime("get", startTime);
         }
     }
 
@@ -114,30 +138,41 @@ public class Database {
      * Быстрый поиск по значению с использованием индекса
      */
     public List<SearchResult> fastSearch(String value) {
-        Set<String> globals = valueIndex.get(value);
-        if (globals == null) {
-            return Collections.emptyList();
-        }
-
-        List<SearchResult> results = new ArrayList<>();
-        storageLock.readLock().lock();
+        long startTime = System.currentTimeMillis();
         try {
-            for (String global : globals) {
-                TreeNode tree = globalStorage.get(global);
-                if (tree != null) {
-                    // Получаем все пути для этого значения
-                    Map<List<Object>, Object> allPaths = tree.getAllPaths();
-                    for (Map.Entry<List<Object>, Object> entry : allPaths.entrySet()) {
-                        if (value.equals(entry.getValue().toString())) {
-                            results.add(new SearchResult(global, entry.getKey().toArray(), entry.getValue()));
+            if (value == null || value.trim().isEmpty()) {
+                return Collections.emptyList();
+            }
+
+            Set<String> globals = valueIndex.get(value);
+            if (globals == null) {
+                return Collections.emptyList();
+            }
+
+            List<SearchResult> results = new ArrayList<>();
+            storageLock.readLock().lock();
+            try {
+                for (String global : globals) {
+                    TreeNode tree = globalStorage.get(global);
+                    if (tree != null) {
+                        // Получаем все пути для этого значения
+                        Map<List<Object>, Object> allPaths = tree.getAllPaths();
+                        for (Map.Entry<List<Object>, Object> entry : allPaths.entrySet()) {
+                            if (value.equals(entry.getValue().toString())) {
+                                results.add(new SearchResult(global, entry.getKey().toArray(), entry.getValue()));
+                            }
                         }
                     }
                 }
+            } finally {
+                storageLock.readLock().unlock();
             }
+
+            metrics.incrementCounter("fast_search_operations");
+            return results;
         } finally {
-            storageLock.readLock().unlock();
+            metrics.recordOperationTime("fast_search", startTime);
         }
-        return results;
     }
 
     /**
@@ -198,65 +233,83 @@ public class Database {
         }
     }
 
-    // Вспомогательный класс для результатов поиска
-    public static class SearchResult {
-        private final String global;
-        private final Object[] path;
-        private final Object value;
-
-        public SearchResult(String global, Object[] path, Object value) {
-            this.global = global;
-            this.path = path;
-            this.value = value;
+    // Валидация из пункта 9
+    private void validateSetOperation(String global, Object[] path, Object value) {
+        if (global == null || global.trim().isEmpty()) {
+            throw new IllegalArgumentException("Global name cannot be empty");
         }
-
-        // Getters
-        public String getGlobal() { return global; }
-        public Object[] getPath() { return path; }
-        public Object getValue() { return value; }
-    }
-
-    // Остальные методы остаются без изменений...
-    public void kill(String global, Object... path) {
-        validateGlobalName(global);
-        String globalName = normalizeGlobalName(global);
-
-        Transaction transaction = currentTransaction.get();
-        if (transaction != null) {
-            transaction.kill(globalName, path);
-        } else {
-            storageLock.writeLock().lock();
-            try {
-                if (path.length == 0) {
-                    globalStorage.remove(globalName);
-                    if (autoEmbeddingEnabled) {
-                        embeddingStorage.removeAllEmbeddings(globalName);
-                    }
-                } else {
-                    TreeNode tree = globalStorage.get(globalName);
-                    if (tree != null) {
-                        tree.removeNode(path);
-                        if (autoEmbeddingEnabled) {
-                            embeddingStorage.removeEmbedding(globalName, path);
-                        }
-                    }
+        if (!global.startsWith("^") && !global.matches("[a-zA-Z_][a-zA-Z0-9_]*")) {
+            throw new IllegalArgumentException("Invalid global name: " + global);
+        }
+        if (value == null) {
+            throw new IllegalArgumentException("Value cannot be null");
+        }
+        // Валидация пути
+        if (path != null) {
+            for (Object p : path) {
+                if (p == null) {
+                    throw new IllegalArgumentException("Path elements cannot be null");
                 }
-            } finally {
-                storageLock.writeLock().unlock();
             }
         }
     }
 
-    public List<QueryResult> query(String global, Object[] path, int depth) {
-        validateGlobalName(global);
-        String globalName = normalizeGlobalName(global);
-
-        storageLock.readLock().lock();
+    // Остальные методы остаются без изменений...
+    public void kill(String global, Object... path) {
+        long startTime = System.currentTimeMillis();
         try {
-            TreeNode tree = globalStorage.get(globalName);
-            return tree != null ? tree.query(path, depth) : Collections.emptyList();
+            validateGlobalName(global);
+            String globalName = normalizeGlobalName(global);
+
+            Transaction transaction = currentTransaction.get();
+            if (transaction != null) {
+                transaction.kill(globalName, path);
+            } else {
+                storageLock.writeLock().lock();
+                try {
+                    if (path.length == 0) {
+                        globalStorage.remove(globalName);
+                        if (autoEmbeddingEnabled) {
+                            embeddingStorage.removeAllEmbeddings(globalName);
+                        }
+                    } else {
+                        TreeNode tree = globalStorage.get(globalName);
+                        if (tree != null) {
+                            tree.removeNode(path);
+                            if (autoEmbeddingEnabled) {
+                                embeddingStorage.removeEmbedding(globalName, path);
+                            }
+                        }
+                    }
+
+                    // Репликация
+                    replicationManager.replicateKill(global, path);
+
+                } finally {
+                    storageLock.writeLock().unlock();
+                }
+            }
+            metrics.incrementCounter("kill_operations");
         } finally {
-            storageLock.readLock().unlock();
+            metrics.recordOperationTime("kill", startTime);
+        }
+    }
+
+    public List<QueryResult> query(String global, Object[] path, int depth) {
+        long startTime = System.currentTimeMillis();
+        try {
+            validateGlobalName(global);
+            String globalName = normalizeGlobalName(global);
+
+            storageLock.readLock().lock();
+            try {
+                TreeNode tree = globalStorage.get(globalName);
+                return tree != null ? tree.query(path, depth) : Collections.emptyList();
+            } finally {
+                storageLock.readLock().unlock();
+            }
+        } finally {
+            metrics.recordOperationTime("query", startTime);
         }
     }
 
@@ -353,10 +406,17 @@ public class Database {
             stats.put("autoEmbeddingEnabled", autoEmbeddingEnabled);
             stats.put("cacheSize", queryCache.size());
             stats.put("indexSize", valueIndex.size());
+            stats.put("replicaCount", replicationManager.getReplicas().size());
             return stats;
         } finally {
             storageLock.readLock().unlock();
         }
+    }
+
+    public Map<String, Object> getDetailedStats() {
+        Map<String, Object> stats = getStats();
+        stats.putAll(metrics.getMetrics());
+        return stats;
     }
 
     public Transaction beginTransaction() {
@@ -451,6 +511,10 @@ public class Database {
             return 0;
         }
         return embeddingStorage.getEmbeddingCount();
+    }
+
+    public ReplicationManager getReplicationManager() {
+        return replicationManager;
     }
 
     // Приватные вспомогательные методы
@@ -727,5 +791,23 @@ public class Database {
             newPath.add(entry.getKey());
             generateEmbeddingForTreeNode(global, entry.getValue(), newPath);
         }
+    }
+
+    // Вспомогательный класс для результатов поиска
+    public static class SearchResult {
+        private final String global;
+        private final Object[] path;
+        private final Object value;
+
+        public SearchResult(String global, Object[] path, Object value) {
+            this.global = global;
+            this.path = path;
+            this.value = value;
+        }
+
+        // Getters
+        public String getGlobal() { return global; }
+        public Object[] getPath() { return path; }
+        public Object getValue() { return value; }
     }
 }

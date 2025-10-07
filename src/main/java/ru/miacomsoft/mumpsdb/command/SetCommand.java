@@ -2,6 +2,7 @@ package ru.miacomsoft.mumpsdb.command;
 
 import ru.miacomsoft.mumpsdb.core.Database;
 import ru.miacomsoft.mumpsdb.server.CommandParser;
+import ru.miacomsoft.mumpsdb.util.DebugUtil;
 
 import java.util.Arrays;
 import java.util.regex.Pattern;
@@ -38,22 +39,26 @@ public class SetCommand {
             Object[] path = command.getPath();
             Object value = command.getValue();
 
-            System.out.println("DEBUG SET COMMAND: name=" + name + ", path=" + Arrays.toString(path) + ", value=" + value);
+            DebugUtil.debug("SET COMMAND: name=%s, path=%s, value=%s",
+                    name, Arrays.toString(path), value);
+
+            // Валидация операции
+            validateSetOperation(name, path, value);
 
             // Обрабатываем функции в значении
             Object processedValue = value;
             if (value instanceof String) {
                 String strValue = (String) value;
-                System.out.println("DEBUG SET COMMAND: Processing value: " + strValue);
+                DebugUtil.debug("SET COMMAND: Processing value: %s", strValue);
                 processedValue = functionHandler.processFunctions(strValue);
-                System.out.println("DEBUG SET COMMAND: Processed value: " + processedValue);
+                DebugUtil.debug("SET COMMAND: Processed value: %s", processedValue);
             }
 
             // Проверяем, является ли это локальной переменной (без ^)
             if (isLocalVariable(name)) {
                 if (writeCommand != null) {
                     writeCommand.setLocalVariable(name, processedValue);
-                    System.out.println("DEBUG SET COMMAND: Set local variable '" + name + "' = '" + processedValue + "'");
+                    DebugUtil.debug("SET COMMAND: Set local variable '%s' = '%s'", name, processedValue);
                     return "OK";
                 } else {
                     return "ERROR: WriteCommand not initialized";
@@ -71,5 +76,26 @@ public class SetCommand {
 
     private boolean isLocalVariable(String name) {
         return name != null && !name.startsWith("^") && name.matches("[a-zA-Z_][a-zA-Z0-9_]*");
+    }
+
+    // Валидация из пункта 9
+    private void validateSetOperation(String global, Object[] path, Object value) {
+        if (global == null || global.trim().isEmpty()) {
+            throw new IllegalArgumentException("Global name cannot be empty");
+        }
+        if (!global.startsWith("^") && !global.matches("[a-zA-Z_][a-zA-Z0-9_]*")) {
+            throw new IllegalArgumentException("Invalid global name: " + global);
+        }
+        if (value == null) {
+            throw new IllegalArgumentException("Value cannot be null");
+        }
+        // Валидация пути
+        if (path != null) {
+            for (Object p : path) {
+                if (p == null) {
+                    throw new IllegalArgumentException("Path elements cannot be null");
+                }
+            }
+        }
     }
 }

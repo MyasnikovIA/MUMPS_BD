@@ -1,9 +1,12 @@
 package ru.miacomsoft.mumpsdb;
 
+import ru.miacomsoft.mumpsdb.benchmark.DatabaseBenchmark;
+import ru.miacomsoft.mumpsdb.console.ConsoleCommandProcessor;
 import ru.miacomsoft.mumpsdb.core.Database;
 import ru.miacomsoft.mumpsdb.persistence.AOFManager;
 import ru.miacomsoft.mumpsdb.persistence.SnapshotService;
 import ru.miacomsoft.mumpsdb.server.SocketServer;
+import ru.miacomsoft.mumpsdb.webserver.WebServer;
 
 import java.io.IOException;
 import java.util.Scanner;
@@ -19,6 +22,7 @@ public class Main {
 
     private Database database;
     private SocketServer socketServer;
+    private WebServer webServer;
     private SnapshotService snapshotService;
     private AOFManager aofManager;
     private ScheduledExecutorService scheduler;
@@ -126,10 +130,18 @@ public class Main {
             scheduler = Executors.newScheduledThreadPool(1);
             scheduler.scheduleAtFixedRate(this::periodicSnapshot, 5, 5, TimeUnit.MINUTES);
 
+            // Запуск бенчмарка при старте (опционально)
+            if (shouldRunBenchmark()) {
+                runStartupBenchmark();
+            }
+
             // Запуск выбранных режимов
             if (socketMode) {
                 startSocketServer();
             }
+
+            // Запуск веб-сервера
+            startWebServer();
 
             if (consoleMode) {
                 startConsoleMode();
@@ -168,12 +180,33 @@ public class Main {
         }
     }
 
+    private void startWebServer() {
+        try {
+            ConfigLoader configLoader = new ConfigLoader();
+            int webPort = Integer.parseInt(configLoader.getProperties()
+                    .getProperty("webserver.port", "8080"));
+            boolean webEnabled = Boolean.parseBoolean(configLoader.getProperties()
+                    .getProperty("webserver.enabled", "true"));
+
+            if (webEnabled) {
+                webServer = new WebServer(database, webPort);
+                webServer.start();
+                System.out.println("Web server started on port " + webPort);
+                System.out.println("Open http://localhost:" + webPort + " in your browser");
+            } else {
+                System.out.println("Web server is disabled in configuration");
+            }
+        } catch (Exception e) {
+            System.err.println("Failed to start web server: " + e.getMessage());
+        }
+    }
+
     private void startConsoleMode() {
         try {
             Thread consoleThread = new Thread(() -> {
                 System.out.println("Console mode starting...");
-                ru.miacomsoft.mumpsdb.console.ConsoleCommandProcessor consoleProcessor =
-                        new ru.miacomsoft.mumpsdb.console.ConsoleCommandProcessor(database);
+                ConsoleCommandProcessor consoleProcessor =
+                        new ConsoleCommandProcessor(database);
                 consoleProcessor.start();
                 // Когда консоль завершится, останавливаем сервер
                 stop();
@@ -215,6 +248,21 @@ public class Main {
         stop();
     }
 
+    private boolean shouldRunBenchmark() {
+        return Boolean.parseBoolean(
+                new ConfigLoader().getProperties()
+                        .getProperty("benchmark.on.startup", "false")
+        );
+    }
+
+    private void runStartupBenchmark() {
+        System.out.println("Running startup benchmark...");
+        DatabaseBenchmark benchmark = new DatabaseBenchmark(database);
+        DatabaseBenchmark.BenchmarkResult result = benchmark.runComprehensiveBenchmark();
+        System.out.println(result.toString());
+        benchmark.shutdown();
+    }
+
     public void stop() {
         if (!running) return;
         running = false;
@@ -229,6 +277,12 @@ public class Main {
             }
         } catch (Exception e) {
             System.err.println("Error saving final snapshot: " + e.getMessage());
+        }
+
+        // Останавливаем веб-сервер
+        if (webServer != null) {
+            webServer.stop();
+            System.out.println("Web server stopped");
         }
 
         // Останавливаем socket server

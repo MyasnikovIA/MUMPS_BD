@@ -1,4 +1,5 @@
 package ru.miacomsoft.mumpsdb.embedding;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -6,6 +7,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -83,32 +85,56 @@ public class SemanticChunker {
      * Получает эмбеддинг для одного текста через Ollama API
      */
     public float[] getEmbedding(String text) throws Exception {
-        JSONObject requestBody = new JSONObject();
-        requestBody.put("model", embeddingModel);
-        requestBody.put("prompt", text);
-
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(ollamaBaseUrl + "/api/embeddings"))
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(requestBody.toString()))
-                .build();
-
-        HttpResponse<String> response = httpClient.send(
-                request, HttpResponse.BodyHandlers.ofString());
-
-        if (response.statusCode() != 200) {
-            throw new RuntimeException("Ошибка при получении эмбеддинга: " + response.body());
+        if (text == null || text.trim().isEmpty()) {
+            throw new IllegalArgumentException("Text cannot be null or empty");
         }
 
-        JSONObject responseJson = new JSONObject(response.body());
-        JSONArray embeddingArray = responseJson.getJSONArray("embedding");
+        try {
+            JSONObject requestBody = new JSONObject();
+            requestBody.put("model", embeddingModel);
+            requestBody.put("prompt", text);
 
-        float[] embedding = new float[embeddingArray.length()];
-        for (int i = 0; i < embeddingArray.length(); i++) {
-            embedding[i] = (float) embeddingArray.getDouble(i);
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(ollamaBaseUrl + "/api/embeddings"))
+                    .header("Content-Type", "application/json")
+                    .timeout(Duration.ofSeconds(30)) // Добавляем timeout
+                    .POST(HttpRequest.BodyPublishers.ofString(requestBody.toString()))
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(
+                    request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() != 200) {
+                throw new RuntimeException("Ошибка при получении эмбеддинга: " +
+                        response.statusCode() + " - " + response.body());
+            }
+
+            JSONObject responseJson = new JSONObject(response.body());
+            if (!responseJson.has("embedding")) {
+                throw new RuntimeException("Invalid response format: missing embedding field");
+            }
+
+            JSONArray embeddingArray = responseJson.getJSONArray("embedding");
+
+            // Проверка размера embedding
+            if (embeddingArray.length() == 0) {
+                throw new RuntimeException("Empty embedding received");
+            }
+
+            float[] embedding = new float[embeddingArray.length()];
+            for (int i = 0; i < embeddingArray.length(); i++) {
+                embedding[i] = (float) embeddingArray.getDouble(i);
+            }
+
+            return embedding;
+
+        } catch (java.net.ConnectException e) {
+            throw new RuntimeException("Cannot connect to embedding service at: " + ollamaBaseUrl, e);
+        } catch (java.net.http.HttpTimeoutException e) {
+            throw new RuntimeException("Embedding service timeout", e);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to get embedding: " + e.getMessage(), e);
         }
-
-        return embedding;
     }
 
     /**
